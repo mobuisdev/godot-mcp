@@ -694,6 +694,15 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              extraArgs: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional: Extra command-line arguments to pass to the game (after --)',
+              },
+              headless: {
+                type: 'boolean',
+                description: 'Optional: Run in headless mode (default: false)',
+              },
             },
             required: ['projectPath'],
           },
@@ -1089,9 +1098,27 @@ class GodotServer {
       }
 
       const cmdArgs = ['-d', '--path', args.projectPath];
+
+      // Add headless flag if requested
+      if (args.headless) {
+        cmdArgs.push('--headless');
+      }
+
+      // Add scene if provided
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
+      }
+
+      // Add extra arguments after -- separator (for game-specific args)
+      if (args.extraArgs && Array.isArray(args.extraArgs) && args.extraArgs.length > 0) {
+        cmdArgs.push('--');
+        for (const arg of args.extraArgs) {
+          if (typeof arg === 'string') {
+            cmdArgs.push(arg);
+          }
+        }
+        this.logDebug(`Adding extra args: ${args.extraArgs.join(' ')}`);
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
