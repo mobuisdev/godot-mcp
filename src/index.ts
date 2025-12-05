@@ -1333,14 +1333,16 @@ class GodotServer {
       );
     }
 
+    // Truncate output to avoid filling up context with large log dumps
+    const MAX_OUTPUT_LINES = 150;
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify(
             {
-              output: this.activeProcess.output,
-              errors: this.activeProcess.errors,
+              output: this.activeProcess.output.slice(-MAX_OUTPUT_LINES),
+              errors: this.activeProcess.errors.slice(-MAX_OUTPUT_LINES),
             },
             null,
             2
