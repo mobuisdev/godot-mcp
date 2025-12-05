@@ -985,12 +985,12 @@ class GodotServer {
             properties: {
               command: {
                 type: 'string',
-                enum: ['click_position', 'move_to', 'target', 'click_entity', 'spawn_enemy', 'clear_target', 'respawn'],
+                enum: ['click_position', 'move_to', 'target', 'click_entity', 'spawn_enemy', 'clear_target', 'respawn', 'press_key'],
                 description: 'Command to execute',
               },
               params: {
                 type: 'object',
-                description: 'Command parameters (e.g., {position: [5, 0, 10]} for move_to, {enemy_id: 0} for target)',
+                description: 'Command parameters (e.g., {position: [5, 0, 10]} for move_to, {key: "i"} for press_key)',
               },
               port: {
                 type: 'number',
