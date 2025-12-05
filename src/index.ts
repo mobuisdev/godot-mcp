@@ -985,12 +985,12 @@ class GodotServer {
             properties: {
               command: {
                 type: 'string',
-                enum: ['click_position', 'move_to', 'target', 'click_entity', 'spawn_enemy', 'clear_target', 'respawn', 'press_key'],
+                enum: ['click_position', 'move_to', 'target', 'click_entity', 'spawn_enemy', 'clear_target', 'respawn', 'press_key', 'click_screen'],
                 description: 'Command to execute',
               },
               params: {
                 type: 'object',
-                description: 'Command parameters (e.g., {position: [5, 0, 10]} for move_to, {key: "i"} for press_key)',
+                description: 'Command parameters (e.g., {position: [5, 0, 10]} for move_to, {key: "i"} for press_key, {position: [x, y]} for click_screen)',
               },
               port: {
                 type: 'number',
@@ -1008,8 +1008,8 @@ class GodotServer {
             properties: {
               query: {
                 type: 'string',
-                enum: ['full', 'player', 'enemies', 'network'],
-                description: 'What state to query (default: full)',
+                enum: ['full', 'scene', 'player', 'enemies', 'network'],
+                description: 'What state to query (default: full). Use "scene" to check if on menu or in game.',
               },
               port: {
                 type: 'number',
@@ -1028,6 +1028,32 @@ class GodotServer {
               condition: {
                 type: 'string',
                 description: 'Condition to evaluate (e.g., "player.hp > 50", "enemy_0.dead", "connected")',
+              },
+              port: {
+                type: 'number',
+                description: 'UDP port (default: 7788)',
+              },
+            },
+            required: ['condition'],
+          },
+        },
+        {
+          name: 'wait_for_condition',
+          description: 'Wait for a condition to become true, polling until success or timeout. Use this after actions that trigger scene transitions (e.g., clicking Play button). Returns immediately if condition is already true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              condition: {
+                type: 'string',
+                description: 'Condition to wait for (e.g., "in_game", "player.alive", "enemy_count == 0")',
+              },
+              timeout: {
+                type: 'number',
+                description: 'Maximum time to wait in milliseconds (default: 10000, max: 30000)',
+              },
+              pollInterval: {
+                type: 'number',
+                description: 'Time between checks in milliseconds (default: 500)',
               },
               port: {
                 type: 'number',
@@ -1080,6 +1106,8 @@ class GodotServer {
           return await this.handleQueryGameState(request.params.arguments);
         case 'evaluate_game_condition':
           return await this.handleEvaluateGameCondition(request.params.arguments);
+        case 'wait_for_condition':
+          return await this.handleWaitForCondition(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1338,8 +1366,11 @@ class GodotServer {
 
     this.logDebug('Stopping active Godot process');
     this.activeProcess.process.kill();
-    const output = this.activeProcess.output;
-    const errors = this.activeProcess.errors;
+
+    // Truncate output to avoid filling up context with large log dumps
+    const MAX_OUTPUT_LINES = 150;
+    const output = this.activeProcess.output.slice(-MAX_OUTPUT_LINES);
+    const errors = this.activeProcess.errors.slice(-MAX_OUTPUT_LINES);
     this.activeProcess = null;
 
     return {
@@ -2473,13 +2504,45 @@ class GodotServer {
   // ==========================================================================
 
   /**
-   * Send a UDP message to the game and wait for response
+   * Send a UDP message to the game with retry logic
+   * Retries on timeout to handle scene transitions
    */
   private async sendGameMessage(
     type: string,
     payload: Record<string, any>,
     port: number = 7788,
-    timeoutMs: number = 5000
+    timeoutMs: number = 2000,
+    maxRetries: number = 3
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const result = await this.sendGameMessageOnce(type, payload, port, timeoutMs);
+
+      // Return immediately on success or non-timeout errors
+      if (result.success || !result.error?.includes('Timeout')) {
+        return result;
+      }
+
+      // Retry on timeout (game might be transitioning)
+      if (attempt < maxRetries) {
+        this.logDebug(`UDP timeout, retrying (attempt ${attempt + 1}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    return {
+      success: false,
+      error: 'Timeout waiting for game response after retries. Is the game running with DevRemoteControl enabled?'
+    };
+  }
+
+  /**
+   * Send a single UDP message to the game and wait for response
+   */
+  private async sendGameMessageOnce(
+    type: string,
+    payload: Record<string, any>,
+    port: number,
+    timeoutMs: number
   ): Promise<{ success: boolean; data?: any; error?: string }> {
     return new Promise((resolve) => {
       const client = dgram.createSocket('udp4');
@@ -2493,7 +2556,7 @@ class GodotServer {
 
       const timeout = setTimeout(() => {
         client.close();
-        resolve({ success: false, error: 'Timeout waiting for game response. Is the game running with DevRemoteControl enabled?' });
+        resolve({ success: false, error: 'Timeout waiting for game response' });
       }, timeoutMs);
 
       client.on('message', (msg) => {
@@ -2634,6 +2697,73 @@ class GodotServer {
         },
       ],
     };
+  }
+
+  /**
+   * Handle the wait_for_condition tool
+   * Polls until condition is true or timeout reached
+   */
+  private async handleWaitForCondition(args: any) {
+    const condition = args?.condition;
+    const port = args?.port || 7788;
+    const timeout = Math.min(args?.timeout || 10000, 30000); // Max 30s
+    const pollInterval = args?.pollInterval || 500;
+
+    if (!condition) {
+      return this.createErrorResponse(
+        'Condition is required',
+        ['Provide a condition like "in_game", "player.alive", "enemy_count == 0"']
+      );
+    }
+
+    this.logDebug(`Waiting for condition: ${condition} (timeout: ${timeout}ms, interval: ${pollInterval}ms)`);
+
+    const startTime = Date.now();
+    let lastError: string | undefined;
+    let attempts = 0;
+
+    while (Date.now() - startTime < timeout) {
+      attempts++;
+
+      // Use shorter timeout for individual checks during polling
+      const result = await this.sendGameMessageOnce('condition', { condition }, port, 1500);
+
+      if (result.success && result.data?.result === true) {
+        const elapsed = Date.now() - startTime;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                condition,
+                result: true,
+                elapsed_ms: elapsed,
+                attempts,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      // Store error for final message if we timeout
+      if (!result.success) {
+        lastError = result.error;
+      }
+
+      // Wait before next poll
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+
+    // Timeout reached
+    const elapsed = Date.now() - startTime;
+    return this.createErrorResponse(
+      `Condition "${condition}" not met within ${timeout}ms`,
+      [
+        `Made ${attempts} attempts over ${elapsed}ms`,
+        lastError ? `Last error: ${lastError}` : 'Condition returned false',
+        'The game may be frozen, loading, or the condition may never become true',
+      ]
+    );
   }
 
   /**
