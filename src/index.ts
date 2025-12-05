@@ -9,10 +9,13 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
+import { Window, Monitor } from 'node-screenshots';
+import sharp from 'sharp';
+import * as dgram from 'dgram';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -933,6 +936,107 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot of the Godot game window or monitors for visual debugging',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              target: {
+                type: 'string',
+                enum: ['godot', 'all_monitors', 'primary_monitor'],
+                description: 'What to capture: godot window, all monitors, or primary monitor (default: godot)',
+              },
+              format: {
+                type: 'string',
+                enum: ['png', 'jpeg', 'bmp'],
+                description: 'Image format (default: png)',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Save to file instead of returning base64',
+              },
+              preset: {
+                type: 'string',
+                enum: ['fast', 'balanced', 'full'],
+                description: 'Preset: fast (1280px, jpeg), balanced (1920px, png), full (no resize). Default: balanced',
+              },
+              maxWidth: {
+                type: 'number',
+                description: 'Max width in pixels, preserves aspect ratio (overrides preset)',
+              },
+              maxHeight: {
+                type: 'number',
+                description: 'Max height in pixels, preserves aspect ratio (overrides preset)',
+              },
+              quality: {
+                type: 'number',
+                description: 'JPEG quality 1-100 (overrides preset, default: 80)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'send_game_command',
+          description: 'Send a command to a running Godot game instance for real-time interaction (requires DevRemoteControl autoload)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              command: {
+                type: 'string',
+                enum: ['click_position', 'move_to', 'target', 'click_entity', 'spawn_enemy', 'clear_target', 'respawn'],
+                description: 'Command to execute',
+              },
+              params: {
+                type: 'object',
+                description: 'Command parameters (e.g., {position: [5, 0, 10]} for move_to, {enemy_id: 0} for target)',
+              },
+              port: {
+                type: 'number',
+                description: 'UDP port (default: 7788)',
+              },
+            },
+            required: ['command'],
+          },
+        },
+        {
+          name: 'query_game_state',
+          description: 'Query the current state of the running Godot game (requires DevRemoteControl autoload)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                enum: ['full', 'player', 'enemies', 'network'],
+                description: 'What state to query (default: full)',
+              },
+              port: {
+                type: 'number',
+                description: 'UDP port (default: 7788)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'evaluate_game_condition',
+          description: 'Evaluate a condition against current game state (requires DevRemoteControl autoload)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              condition: {
+                type: 'string',
+                description: 'Condition to evaluate (e.g., "player.hp > 50", "enemy_0.dead", "connected")',
+              },
+              port: {
+                type: 'number',
+                description: 'UDP port (default: 7788)',
+              },
+            },
+            required: ['condition'],
+          },
+        },
       ],
     }));
 
@@ -968,6 +1072,14 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
+        case 'send_game_command':
+          return await this.handleSendGameCommand(request.params.arguments);
+        case 'query_game_state':
+          return await this.handleQueryGameState(request.params.arguments);
+        case 'evaluate_game_condition':
+          return await this.handleEvaluateGameCondition(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2179,6 +2291,349 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * Captures a screenshot of the Godot game window or monitors
+   * Supports presets and resizing via Sharp
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+
+    // Preset definitions
+    const PRESETS: Record<string, { maxWidth?: number; format: string; quality: number }> = {
+      fast: { maxWidth: 1280, format: 'jpeg', quality: 70 },
+      balanced: { maxWidth: 1920, format: 'jpeg', quality: 80 },
+      full: { format: 'png', quality: 100 },
+    };
+
+    // Resolve preset (default: balanced)
+    const presetName = args.preset || 'balanced';
+    const preset = PRESETS[presetName] || PRESETS.balanced;
+
+    // Allow parameter overrides
+    const target = args.target || 'godot';
+    const maxWidth = args.maxWidth ?? preset.maxWidth;
+    const maxHeight = args.maxHeight;
+    const format = args.format || preset.format;
+    const quality = args.quality ?? preset.quality;
+    const outputPath = args.outputPath;
+
+    this.logDebug(`Capturing screenshot: target=${target}, preset=${presetName}, format=${format}, maxWidth=${maxWidth}, quality=${quality}`);
+
+    try {
+      let rawImage: Buffer;
+
+      if (target === 'godot') {
+        // Find Godot window by app name
+        const windows = Window.all();
+        this.logDebug(`Found ${windows.length} windows`);
+
+        // Look for game window first (contains DEBUG), then fall back to editor
+        const gameWindow = windows.find(w => {
+          const title = (w.title || '').toLowerCase();
+          return title.includes('(debug)');
+        });
+
+        const editorWindow = windows.find(w => {
+          const appName = (w.appName || '').toLowerCase();
+          return appName.includes('godot');
+        });
+
+        const godotWindow = gameWindow || editorWindow;
+
+        if (!godotWindow) {
+          // List available windows for debugging
+          const windowNames = windows.map(w => w.appName || 'unknown').join(', ');
+          return this.createErrorResponse(
+            'No Godot window found',
+            [
+              'Ensure Godot is running with a visible window',
+              `Available windows: ${windowNames}`,
+            ]
+          );
+        }
+
+        this.logDebug(`Capturing Godot window: ${godotWindow.appName}`);
+        const captured = godotWindow.captureImageSync();
+        rawImage = captured.toPngSync(); // Always capture as PNG first for quality
+      } else if (target === 'primary_monitor') {
+        const monitors = Monitor.all();
+        const primary = monitors.find(m => m.isPrimary) || monitors[0];
+
+        if (!primary) {
+          return this.createErrorResponse(
+            'No monitor found',
+            ['Check display configuration']
+          );
+        }
+
+        this.logDebug(`Capturing primary monitor`);
+        const captured = primary.captureImageSync();
+        rawImage = captured.toPngSync();
+      } else {
+        // all_monitors - for now, capture primary monitor
+        const monitors = Monitor.all();
+        const primary = monitors.find(m => m.isPrimary) || monitors[0];
+
+        if (!primary) {
+          return this.createErrorResponse(
+            'No monitor found',
+            ['Check display configuration']
+          );
+        }
+
+        this.logDebug(`Capturing all monitors (primary for now)`);
+        const captured = primary.captureImageSync();
+        rawImage = captured.toPngSync();
+      }
+
+      // Process with Sharp for resizing and format conversion
+      let image: Buffer;
+      const needsProcessing = maxWidth || maxHeight || format === 'jpeg';
+
+      if (needsProcessing) {
+        let sharpInstance = sharp(rawImage);
+
+        // Resize if dimensions specified
+        if (maxWidth || maxHeight) {
+          sharpInstance = sharpInstance.resize(
+            maxWidth || undefined,
+            maxHeight || undefined,
+            {
+              fit: 'inside',
+              withoutEnlargement: true,
+            }
+          );
+        }
+
+        // Convert to target format
+        if (format === 'jpeg') {
+          image = await sharpInstance.jpeg({ quality }).toBuffer();
+        } else if (format === 'bmp') {
+          // Sharp doesn't support BMP output, convert via raw
+          image = await sharpInstance.png().toBuffer();
+        } else {
+          image = await sharpInstance.png().toBuffer();
+        }
+      } else {
+        image = rawImage;
+      }
+
+      // Always save a copy to debug-screenshots (relative to MCP root)
+      const debugDir = join(__dirname, '..', 'debug-screenshots');
+      if (!existsSync(debugDir)) {
+        mkdirSync(debugDir, { recursive: true });
+      }
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const ext = format === 'jpeg' ? 'jpg' : format;
+      const debugPath = join(debugDir, `screenshot-${timestamp}.${ext}`);
+      writeFileSync(debugPath, image);
+      this.logDebug(`Screenshot saved to: ${debugPath}`);
+
+      // Either save to file or return as base64
+      if (outputPath) {
+        writeFileSync(outputPath, image);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot saved to: ${outputPath}`,
+            },
+          ],
+        };
+      } else {
+        const base64 = image.toString('base64');
+        const mimeType = format === 'jpeg' ? 'image/jpeg' :
+                         format === 'bmp' ? 'image/bmp' : 'image/png';
+        return {
+          content: [
+            {
+              type: 'image',
+              data: base64,
+              mimeType: mimeType,
+            },
+          ],
+        };
+      }
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is running with a visible window',
+          'Check display permissions (on Linux, may need X11/Wayland access)',
+        ]
+      );
+    }
+  }
+
+  // ==========================================================================
+  // GAME REMOTE CONTROL (UDP communication with DevRemoteControl autoload)
+  // ==========================================================================
+
+  /**
+   * Send a UDP message to the game and wait for response
+   */
+  private async sendGameMessage(
+    type: string,
+    payload: Record<string, any>,
+    port: number = 7788,
+    timeoutMs: number = 5000
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    return new Promise((resolve) => {
+      const client = dgram.createSocket('udp4');
+      const msgId = Math.random().toString(36).substring(7);
+
+      const message = JSON.stringify({
+        type,
+        id: msgId,
+        ...payload
+      });
+
+      const timeout = setTimeout(() => {
+        client.close();
+        resolve({ success: false, error: 'Timeout waiting for game response. Is the game running with DevRemoteControl enabled?' });
+      }, timeoutMs);
+
+      client.on('message', (msg) => {
+        clearTimeout(timeout);
+        client.close();
+        try {
+          const response = JSON.parse(msg.toString());
+          if (response.id === msgId) {
+            resolve({ success: true, data: response });
+          } else {
+            resolve({ success: false, error: 'Response ID mismatch' });
+          }
+        } catch (e) {
+          resolve({ success: false, error: 'Invalid JSON response from game' });
+        }
+      });
+
+      client.on('error', (err) => {
+        clearTimeout(timeout);
+        client.close();
+        resolve({ success: false, error: `UDP error: ${err.message}` });
+      });
+
+      client.send(message, port, '127.0.0.1', (err) => {
+        if (err) {
+          clearTimeout(timeout);
+          client.close();
+          resolve({ success: false, error: `Failed to send UDP message: ${err.message}` });
+        }
+      });
+    });
+  }
+
+  /**
+   * Handle the send_game_command tool
+   */
+  private async handleSendGameCommand(args: any) {
+    const command = args?.command;
+    const params = args?.params || {};
+    const port = args?.port || 7788;
+
+    if (!command) {
+      return this.createErrorResponse(
+        'Command is required',
+        ['Provide a command like "move_to", "target", "spawn_enemy"']
+      );
+    }
+
+    this.logDebug(`Sending game command: ${command} with params: ${JSON.stringify(params)}`);
+
+    const result = await this.sendGameMessage('command', { command, params }, port);
+
+    if (!result.success) {
+      return this.createErrorResponse(
+        result.error || 'Failed to send command',
+        [
+          'Ensure the game is running',
+          'Ensure DevRemoteControl autoload is active (dev mode only)',
+          'Check that port 7788 is not blocked',
+        ]
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result.data, null, 2),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the query_game_state tool
+   */
+  private async handleQueryGameState(args: any) {
+    const query = args?.query || 'full';
+    const port = args?.port || 7788;
+
+    this.logDebug(`Querying game state: ${query}`);
+
+    const result = await this.sendGameMessage('query', { query }, port);
+
+    if (!result.success) {
+      return this.createErrorResponse(
+        result.error || 'Failed to query game state',
+        [
+          'Ensure the game is running',
+          'Ensure DevRemoteControl autoload is active (dev mode only)',
+        ]
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result.data, null, 2),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the evaluate_game_condition tool
+   */
+  private async handleEvaluateGameCondition(args: any) {
+    const condition = args?.condition;
+    const port = args?.port || 7788;
+
+    if (!condition) {
+      return this.createErrorResponse(
+        'Condition is required',
+        ['Provide a condition like "player.hp > 50", "enemy_0.dead", "connected"']
+      );
+    }
+
+    this.logDebug(`Evaluating condition: ${condition}`);
+
+    const result = await this.sendGameMessage('condition', { condition }, port);
+
+    if (!result.success) {
+      return this.createErrorResponse(
+        result.error || 'Failed to evaluate condition',
+        [
+          'Ensure the game is running',
+          'Ensure DevRemoteControl autoload is active (dev mode only)',
+        ]
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result.data, null, 2),
+        },
+      ],
+    };
   }
 
   /**
