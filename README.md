@@ -79,6 +79,12 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+- **Interactive Testing** (requires DevRemoteControl autoload):
+  - Query game state (player, enemies, network)
+  - Send game commands (move, target, spawn enemies)
+  - Simulate keyboard input (press_key)
+  - Evaluate game conditions
+  - Capture screenshots for visual debugging
 
 ## Requirements
 
@@ -202,6 +208,64 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Get the UID for a specific script file in my Godot 4.4 project"
 
 "Update UID references in my Godot project after upgrading to 4.4"
+```
+
+## Interactive Testing
+
+The MCP server includes tools for real-time game interaction via UDP (requires `DevRemoteControl` autoload in your Godot project).
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `query_game_state` | Get player, enemy, or network state |
+| `send_game_command` | Send input commands to the game |
+| `evaluate_game_condition` | Check if a condition is true/false |
+| `capture_screenshot` | Capture the game window |
+
+### send_game_command
+
+| Command | Params | Description |
+|---------|--------|-------------|
+| `move_to` | `{position: [x, y, z]}` | Move player to position |
+| `target` | `{enemy_id: N}` | Target specific enemy |
+| `spawn_enemy` | `{position: [x,y,z], behavior?}` | Spawn enemy |
+| `clear_target` | `{}` | Clear current target |
+| `respawn` | `{}` | Request respawn |
+| `press_key` | `{key: "i", pressed?: true}` | Simulate keyboard input |
+
+### press_key - Supported Keys
+
+| Category | Keys |
+|----------|------|
+| Letters | `a`-`z` |
+| Numbers | `0`-`9` |
+| Modifiers | `ctrl`, `alt`, `shift`, `meta`/`super`/`command` |
+| Navigation | `space`, `tab`, `enter`, `escape`, `backspace` |
+| Editing | `delete`, `insert`, `home`, `end`, `pageup`, `pagedown` |
+| Arrows | `up`, `down`, `left`, `right` |
+| Function | `f1`-`f12` |
+
+### Example Usage
+
+```javascript
+// Query player state
+mcp__godot__query_game_state({query: "player"})
+
+// Move to position
+mcp__godot__send_game_command({command: "move_to", params: {position: [5, 0, 10]}})
+
+// Open inventory with 'I' key
+mcp__godot__send_game_command({command: "press_key", params: {key: "i"}})
+
+// Ctrl+S combination
+mcp__godot__send_game_command({command: "press_key", params: {key: "ctrl"}})
+mcp__godot__send_game_command({command: "press_key", params: {key: "s"}})
+mcp__godot__send_game_command({command: "press_key", params: {key: "s", pressed: false}})
+mcp__godot__send_game_command({command: "press_key", params: {key: "ctrl", pressed: false}})
+
+// Check condition
+mcp__godot__evaluate_game_condition({condition: "player.alive"})
 ```
 
 ## Implementation Details
